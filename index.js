@@ -35,16 +35,16 @@ function buildRanges() {
     const pktNow = new Date(now.getTime() + PKT_OFFSET_MS);
     const toUtc = (pkt) => new Date(pkt.getTime() - PKT_OFFSET_MS).toISOString();
 
+    // 12:00 AM (midnight) today in Pakistan Time
     const todayMidnight = new Date(pktNow);
     todayMidnight.setUTCHours(0, 0, 0, 0);
-    const todayNoon = new Date(todayMidnight); todayNoon.setUTCHours(12);
-    const yesterdayNoon = new Date(todayNoon.getTime() - 86400000);
 
     return {
         "24h": { unit: "hour", start: toUtc(new Date(pktNow.getTime() - 24 * 3600000)), end: toUtc(pktNow) },
-        "daily": { unit: "hour", start: toUtc(yesterdayNoon), end: toUtc(todayNoon) },
+        "daily": { unit: "hour", start: toUtc(todayMidnight), end: toUtc(pktNow) },
         "7d": { unit: "day", start: toUtc(new Date(pktNow.getTime() - 7 * 86400000)), end: toUtc(pktNow) },
-        "30d": { unit: "day", start: toUtc(new Date(pktNow.getTime() - 30 * 86400000)), end: toUtc(pktNow) }
+        "30d": { unit: "day", start: toUtc(new Date(pktNow.getTime() - 30 * 86400000)), end: toUtc(pktNow) },
+        "yearly": { unit: "month", start: toUtc(new Date(pktNow.getTime() - 365 * 86400000)), end: toUtc(pktNow) }
     };
 }
 
