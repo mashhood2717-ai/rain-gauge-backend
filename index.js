@@ -39,12 +39,18 @@ function buildRanges() {
     const todayMidnight = new Date(pktNow);
     todayMidnight.setUTCHours(0, 0, 0, 0);
 
+    // January 1st of the current year, 12:00 AM Pakistan Time
+    const janFirst = new Date(pktNow);
+    janFirst.setUTCMonth(0, 1);
+    janFirst.setUTCHours(0, 0, 0, 0);
+
     return {
         "24h": { unit: "hour", start: toUtc(new Date(pktNow.getTime() - 24 * 3600000)), end: toUtc(pktNow) },
         "daily": { unit: "hour", start: toUtc(todayMidnight), end: toUtc(pktNow) },
         "7d": { unit: "day", start: toUtc(new Date(pktNow.getTime() - 7 * 86400000)), end: toUtc(pktNow) },
         "30d": { unit: "day", start: toUtc(new Date(pktNow.getTime() - 30 * 86400000)), end: toUtc(pktNow) },
-        "yearly": { unit: "month", start: toUtc(new Date(pktNow.getTime() - 365 * 86400000)), end: toUtc(pktNow) }
+        "365d": { unit: "month", start: toUtc(new Date(pktNow.getTime() - 365 * 86400000)), end: toUtc(pktNow) },
+        "this_year": { unit: "month", start: toUtc(janFirst), end: toUtc(pktNow) }
     };
 }
 
