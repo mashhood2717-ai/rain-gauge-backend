@@ -44,13 +44,16 @@ function buildRanges() {
     janFirst.setUTCMonth(0, 1);
     janFirst.setUTCHours(0, 0, 0, 0);
 
+    // Arbitrary past date to cover "since installation"
+    const installationDate = new Date(Date.UTC(2010, 0, 1));
+
     return {
         "24h": { unit: "hour", start: toUtc(new Date(pktNow.getTime() - 24 * 3600000)), end: toUtc(pktNow) },
         "daily": { unit: "hour", start: toUtc(todayMidnight), end: toUtc(pktNow) },
-        "7d": { unit: "day", start: toUtc(new Date(pktNow.getTime() - 7 * 86400000)), end: toUtc(pktNow) },
-        "30d": { unit: "day", start: toUtc(new Date(pktNow.getTime() - 30 * 86400000)), end: toUtc(pktNow) },
-        "365d": { unit: "month", start: toUtc(new Date(pktNow.getTime() - 365 * 86400000)), end: toUtc(pktNow) },
-        "this_year": { unit: "month", start: toUtc(janFirst), end: toUtc(pktNow) }
+        "7d": { unit: "day", start: toUtc(new Date(todayMidnight.getTime() - 7 * 86400000)), end: toUtc(todayMidnight) },
+        "30d": { unit: "day", start: toUtc(new Date(todayMidnight.getTime() - 30 * 86400000)), end: toUtc(todayMidnight) },
+        "this_year": { unit: "month", start: toUtc(janFirst), end: toUtc(todayMidnight) },
+        "all_time": { unit: "month", start: installationDate.toISOString(), end: toUtc(pktNow) }
     };
 }
 
