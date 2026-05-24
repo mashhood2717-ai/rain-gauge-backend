@@ -73,7 +73,6 @@ async function syncAllData() {
         const chunkSize = 10;
         for (let i = 0; i < devices.length; i += chunkSize) {
             const chunk = devices.slice(i, i + chunkSize);
-            console.log(`Fetching batch ${Math.floor(i/chunkSize) + 1} of ${Math.ceil(devices.length/chunkSize)}...`);
             
             const promises = chunk.map(async (dev) => {
                 const row = { id: dev._id, name: dev.name, status: dev.state?.status };
@@ -129,6 +128,11 @@ async function syncAllData() {
 // ═══════════════════════════════════════════════════════════════
 // API ROUTES
 // ═══════════════════════════════════════════════════════════════
+
+// Lightweight endpoint just to keep the server awake (use this for cron-job.org)
+app.get('/ping', (req, res) => {
+    res.send('ok');
+});
 
 // Main endpoint for your dashboard
 app.get('/api', (req, res) => {
