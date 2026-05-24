@@ -50,9 +50,9 @@ function buildRanges() {
     return {
         "24h": { unit: "hour", start: toUtc(new Date(pktNow.getTime() - 24 * 3600000)), end: toUtc(pktNow) },
         "daily": { unit: "hour", start: toUtc(todayMidnight), end: toUtc(pktNow) },
-        "7d": { unit: "day", start: toUtc(new Date(todayMidnight.getTime() - 7 * 86400000)), end: toUtc(todayMidnight) },
-        "30d": { unit: "day", start: toUtc(new Date(todayMidnight.getTime() - 30 * 86400000)), end: toUtc(todayMidnight) },
-        "this_year": { unit: "month", start: toUtc(janFirst), end: toUtc(todayMidnight) },
+        "7d": { unit: "day", start: toUtc(new Date(todayMidnight.getTime() - 7 * 86400000)), end: toUtc(pktNow) },
+        "30d": { unit: "day", start: toUtc(new Date(todayMidnight.getTime() - 30 * 86400000)), end: toUtc(pktNow) },
+        "this_year": { unit: "month", start: toUtc(janFirst), end: toUtc(pktNow) },
         "all_time": { unit: "month", start: installationDate.toISOString(), end: toUtc(pktNow) }
     };
 }
