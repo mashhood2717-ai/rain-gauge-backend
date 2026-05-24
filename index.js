@@ -158,8 +158,8 @@ app.get('/force-sync', (req, res) => {
 app.listen(PORT, () => {
     console.log(`Backend Server running on port ${PORT}`);
     
-    // Schedule the sync to run automatically every hour at minute 0
-    cron.schedule('0 * * * *', () => {
+    // Schedule the sync to run automatically every 10 minutes
+    cron.schedule('*/10 * * * *', () => {
         syncAllData();
     });
 
