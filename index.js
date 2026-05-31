@@ -163,7 +163,6 @@ async function buildRainGaugeRow(dev, ranges) {
     const row = {
         id: dev._id,
         name: dev.name,
-        type: 'rain_gauge',
         status: dev.state?.status,
         lat: coords.lat,
         lng: coords.lng,
@@ -172,28 +171,45 @@ async function buildRainGaugeRow(dev, ranges) {
     return row;
 }
 
-// Weather stations expose more parameters (temp, humidity, wind, pressure).
-// GarajCloud's `lastReading` map carries the current values keyed by
-// `<parameter>-<unit>` — we surface it as-is plus the parsed `state` so the
-// dashboard can extract whatever it needs.
-async function buildWeatherStationRow(dev, ranges) {
+// Pull a numeric reading out of GarajCloud's lastReading map. Keys look like
+// "Temperature-˚C", "Wind_Speed-m/s", etc. — we match on the leading
+// parameter name (everything before the first `-`) so unit drift on the
+// upstream side doesn't blank the field.
+function readingValue(lastReading, parameterName) {
+    if (!lastReading || typeof lastReading !== 'object') return null;
+    const target = String(parameterName).toLowerCase();
+    for (const [k, v] of Object.entries(lastReading)) {
+        const param = String(k).split('-')[0].trim().toLowerCase();
+        if (param === target) {
+            const n = Number(v?.value);
+            return Number.isFinite(n) ? n : null;
+        }
+    }
+    return null;
+}
+
+// Weather stations expose temp / humidity / wind / pressure / heat index
+// in the device's `lastReading` map. We flatten the values out so the row
+// stays compact and the dashboard doesn't have to parse GarajCloud's
+// parameter-key-unit shape itself. Rainfall isn't surfaced for WS because
+// one of the stations returns an obvious overflow value (~42M mm) and the
+// other two report 0 — it's not a useful field here.
+async function buildWeatherStationRow(dev) {
     const coords = await resolveCoords(dev);
-    const row = {
+    const lr = dev.lastReading || {};
+    return {
         id: dev._id,
         name: dev.name,
-        type: 'weather_station',
         status: dev.state?.status,
         lat: coords.lat,
         lng: coords.lng,
-        state: dev.state || null,
-        lastReading: dev.lastReading || null,
+        temperature:    readingValue(lr, 'Temperature'),
+        humidity:       readingValue(lr, 'Relative_Humidity'),
+        wind_direction: readingValue(lr, 'Wind_Direction'),
+        wind_speed:     readingValue(lr, 'Wind_Speed'),
+        pressure:       readingValue(lr, 'Pressure'),
+        heat_index:     readingValue(lr, 'Heat_Index'),
     };
-    try {
-        Object.assign(row, await fetchRainfallTotals(dev._id, ranges));
-    } catch (e) {
-        console.warn(`[ws] rainfall fetch failed for ${dev.name}: ${e.message}`);
-    }
-    return row;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -239,25 +255,24 @@ async function syncAllData() {
         rainGauges.sort((a, b) => (b["24h"] ?? 0) - (a["24h"] ?? 0));
 
         // ── Weather stations ────────────────────────────────────────────────
-        const weatherStations = [];
-        for (let i = 0; i < wsDevices.length; i += chunkSize) {
-            const chunk = wsDevices.slice(i, i + chunkSize);
-            const rows = await Promise.all(chunk.map(d => buildWeatherStationRow(d, ranges)));
-            weatherStations.push(...rows);
-        }
+        // No rainfall fetch for WS (one device returns a 32-bit overflow value
+        // upstream; the other two report 0) — temp/humidity/wind/pressure
+        // come straight from the device's lastReading map.
+        const weatherStations = await Promise.all(wsDevices.map(d => buildWeatherStationRow(d)));
 
+        // `/api` returns RG + WS combined so the Cloudflare Worker (which
+        // hits `/api` and writes one row per device to D1 every 15 min)
+        // tracks uptime/downtime for ALL devices, not just rain gauges.
+        // Each device is identifiable by the `RG - ` / `WS - ` name prefix.
         const finalData = {
             lastUpdated: new Date().toISOString(),
-            // `devices` kept for backwards compatibility — old consumers (e.g.
-            // the Cloudflare Worker) expect a flat list of rain gauges here.
-            devices: rainGauges,
-            // New, cleanly separated views:
+            devices: [...rainGauges, ...weatherStations],
             rainGauges,
             weatherStations,
         };
 
         fs.writeFileSync(CACHE_FILE, JSON.stringify(finalData, null, 2));
-        console.log(`[${new Date().toISOString()}] Sync complete! Saved ${rainGauges.length} rain gauges, ${weatherStations.length} weather stations. Assets cached: ${_assetCache.size}.`);
+        console.log(`[${new Date().toISOString()}] Sync complete! Saved ${rainGauges.length} rain gauges, ${weatherStations.length} weather stations (${finalData.devices.length} total). Assets cached: ${_assetCache.size}.`);
 
     } catch (e) {
         console.error("Critical error during sync:", e.message);
@@ -284,9 +299,12 @@ app.get('/ping', (req, res) => {
     res.send('ok');
 });
 
-// Main endpoint for your dashboard — unchanged shape. `devices` is rain
-// gauges only, just as before, so existing consumers keep working. Each
-// row now also includes `lat`, `lng`, and `type: 'rain_gauge'`.
+// Main endpoint for your dashboard. `devices` is the combined list of
+// rain gauges + weather stations (90 total) so the Cloudflare Worker
+// tracks uptime/downtime for all devices. Each row carries `lat`, `lng`;
+// rain gauges carry the rainfall window fields (24h/daily/7d/30d/...);
+// weather stations carry temperature/humidity/wind_*/pressure/heat_index.
+// Identify each by the `RG - ` / `WS - ` name prefix.
 app.get('/api', (req, res) => {
     const data = readCache();
     if (!data) {
