@@ -18,81 +18,78 @@ const API_KEY = "a10187411c5bc066f220a98aa88a52e7:e29a0c11f5cbb5b45cffc80a835fa7
 const BASE_URL = "https://http.api.connectivity-dynasys.garajcloud.com/api";
 const RAIN_GAUGE_TYPE_ID = "67fd6a83336210a2d40cba16";
 
-// Weather-station device type ID is auto-discovered the first time the sync
-// runs by querying /external/device-types and matching by name. Setting this
-// to a hard-coded value here will short-circuit discovery if it's ever needed.
-let WEATHER_STATION_TYPE_ID = null;
-
 const PKT_OFFSET_MS = 5 * 60 * 60 * 1000; // Pakistan Time (UTC+5)
 const axiosConfig = { headers: { "api-key": API_KEY } };
 
 // ═══════════════════════════════════════════════════════════════
-// HELPER FUNCTIONS
+// DEVICE / ASSET FETCH HELPERS
 // ═══════════════════════════════════════════════════════════════
+
+// Pull the entire device list in one call (no deviceType filter) so we get
+// rain gauges AND weather stations together. GarajCloud paginates with skip
+// /limit — for now 200 covers both types comfortably (87 RG + 3 WS = 90).
+async function getAllDevices() {
+    const url = `${BASE_URL}/apps/ignite-shield/external/devices`;
+    const res = await axios.get(url, { ...axiosConfig, params: { skip: 0, limit: 200 } });
+    return res.data?.data?.devices ?? [];
+}
+
+// Fallback path (kept so the rain-gauge-only sync still works if the no-
+// filter call ever returns something unexpected).
 async function getDevicesByType(deviceTypeId) {
     const url = `${BASE_URL}/apps/ignite-shield/external/devices`;
     const res = await axios.get(url, { ...axiosConfig, params: { deviceType: deviceTypeId, skip: 0, limit: 100 } });
     return res.data?.data?.devices ?? [];
 }
 
-// Kept for backwards compatibility with anything that imported the old name.
-async function getDevices() {
-    return getDevicesByType(RAIN_GAUGE_TYPE_ID);
-}
+// Per-sync asset cache so multiple devices pointing at the same asset only
+// trigger one HTTP call. Wiped at the start of every sync to avoid serving
+// stale coordinates if an asset ever moves.
+let _assetCache = new Map();
 
-async function getDeviceTypes() {
-    const url = `${BASE_URL}/apps/ignite-shield/external/device-types`;
-    const res = await axios.get(url, axiosConfig);
-    // GarajCloud often nests collections at .data.<entityName> — try a few paths.
-    return res.data?.data?.deviceTypes
-        ?? res.data?.data?.types
-        ?? res.data?.data
-        ?? [];
-}
-
-// Look up the weather-station device type ID by name. Cached on success so we
-// only do this once per process. Best-effort — if the API isn't shaped how we
-// expect, we return null and the sync continues with rain-gauges only.
-async function discoverWeatherStationTypeId() {
-    if (WEATHER_STATION_TYPE_ID) return WEATHER_STATION_TYPE_ID;
+async function getAssetById(assetId) {
+    if (!assetId) return null;
+    if (_assetCache.has(assetId)) return _assetCache.get(assetId);
     try {
-        const types = await getDeviceTypes();
-        const list = Array.isArray(types) ? types : Object.values(types || {});
-        const match = list.find(t => /weather\s*station|^WS\b/i.test(t?.name || ''));
-        if (match?._id) {
-            WEATHER_STATION_TYPE_ID = match._id;
-            console.log(`[discover] weather-station device type id: ${WEATHER_STATION_TYPE_ID} (${match.name})`);
-        } else {
-            console.log(`[discover] weather-station device type not found in /external/device-types response (${list.length} types listed). Hit /api/debug/device-types to inspect.`);
-        }
+        const url = `${BASE_URL}/apps/ignite-shield/external/assets/${assetId}`;
+        const res = await axios.get(url, axiosConfig);
+        // Response could be { data: { asset } } or { data: <asset> } depending
+        // on the API style — handle both.
+        const asset = res.data?.data?.asset ?? res.data?.data ?? res.data ?? null;
+        _assetCache.set(assetId, asset);
+        return asset;
     } catch (e) {
-        console.warn(`[discover] failed to list device types: ${e.message}`);
+        // Don't fail the sync for a single asset lookup — just record null
+        // coords for that device.
+        console.warn(`[asset] ${assetId}: ${e.message}`);
+        _assetCache.set(assetId, null);
+        return null;
     }
-    return WEATHER_STATION_TYPE_ID;
 }
 
-// Pull lat/lng off a GarajCloud device payload. Tries several common shapes
-// without throwing if any of them are missing — returns nulls when nothing
-// looks like coordinates.
-function extractCoords(dev) {
-    if (!dev || typeof dev !== 'object') return { lat: null, lng: null };
+// Pull lat/lng off a GarajCloud asset payload. Confirmed shape (from DynaSys):
+//   asset.geoLocation = { type: 'Point', coordinates: [lng, lat] }
+// Still defensive — falls back to other common paths so a single API change
+// upstream doesn't blank out every map pin.
+function extractCoordsFromAsset(asset) {
+    if (!asset || typeof asset !== 'object') return { lat: null, lng: null };
     const num = (v) => {
         if (v === null || v === undefined || v === '') return null;
         const n = Number(v);
         return Number.isFinite(n) ? n : null;
     };
 
-    // GeoJSON shape: location.coordinates = [lng, lat]
-    if (Array.isArray(dev.location?.coordinates) && dev.location.coordinates.length >= 2) {
-        return { lat: num(dev.location.coordinates[1]), lng: num(dev.location.coordinates[0]) };
-    }
-    if (Array.isArray(dev.coordinates) && dev.coordinates.length >= 2) {
-        return { lat: num(dev.coordinates[1]), lng: num(dev.coordinates[0]) };
+    // Confirmed GarajCloud shape (GeoJSON Point — [lng, lat] order)
+    if (Array.isArray(asset.geoLocation?.coordinates) && asset.geoLocation.coordinates.length >= 2) {
+        return { lat: num(asset.geoLocation.coordinates[1]), lng: num(asset.geoLocation.coordinates[0]) };
     }
 
-    // Common flat / nested fields
-    const lat = num(dev.lat ?? dev.latitude ?? dev.location?.lat ?? dev.location?.latitude ?? dev.geo?.lat);
-    const lng = num(dev.lng ?? dev.lon ?? dev.longitude ?? dev.location?.lng ?? dev.location?.lon ?? dev.location?.longitude ?? dev.geo?.lng ?? dev.geo?.lon);
+    // Defensive fallbacks
+    if (Array.isArray(asset.location?.coordinates) && asset.location.coordinates.length >= 2) {
+        return { lat: num(asset.location.coordinates[1]), lng: num(asset.location.coordinates[0]) };
+    }
+    const lat = num(asset.lat ?? asset.latitude ?? asset.location?.lat ?? asset.location?.latitude);
+    const lng = num(asset.lng ?? asset.lon ?? asset.longitude ?? asset.location?.lng ?? asset.location?.lon ?? asset.location?.longitude);
     return { lat, lng };
 }
 
@@ -127,8 +124,6 @@ function buildRanges() {
 // PER-DEVICE FETCH HELPERS
 // ═══════════════════════════════════════════════════════════════
 
-// Rainfall totals across the 6 standard time windows for one device. Used for
-// rain gauges (and weather stations that report rain too — same metric name).
 async function fetchRainfallTotals(deviceId, ranges) {
     const out = {};
     for (const [period, range] of Object.entries(ranges)) {
@@ -155,10 +150,16 @@ async function fetchRainfallTotals(deviceId, ranges) {
     return out;
 }
 
-// Build the row we serve to the dashboard for a rain gauge. Same shape as the
-// original `syncAllData` produced, but now also includes lat / lng / type.
+// Resolve coordinates for one device by looking up its asset (cached).
+async function resolveCoords(dev) {
+    const assetId = typeof dev.asset === 'string' ? dev.asset : (dev.asset?._id || dev.asset?.id || null);
+    if (!assetId) return { lat: null, lng: null };
+    const asset = await getAssetById(assetId);
+    return extractCoordsFromAsset(asset);
+}
+
 async function buildRainGaugeRow(dev, ranges) {
-    const coords = extractCoords(dev);
+    const coords = await resolveCoords(dev);
     const row = {
         id: dev._id,
         name: dev.name,
@@ -172,12 +173,11 @@ async function buildRainGaugeRow(dev, ranges) {
 }
 
 // Weather stations expose more parameters (temp, humidity, wind, pressure).
-// We don't yet know the exact reading field names on GarajCloud's side, so we
-// pass through the device's `state` object verbatim and let downstream code
-// pick out what it needs. We also include rainfall totals because the user
-// said these stations are "full-fledged" — they may well have rain sensors.
+// GarajCloud's `lastReading` map carries the current values keyed by
+// `<parameter>-<unit>` — we surface it as-is plus the parsed `state` so the
+// dashboard can extract whatever it needs.
 async function buildWeatherStationRow(dev, ranges) {
-    const coords = extractCoords(dev);
+    const coords = await resolveCoords(dev);
     const row = {
         id: dev._id,
         name: dev.name,
@@ -185,18 +185,12 @@ async function buildWeatherStationRow(dev, ranges) {
         status: dev.state?.status,
         lat: coords.lat,
         lng: coords.lng,
-        // Pass through GarajCloud's raw state so the dashboard can read temp /
-        // humidity / wind / pressure once we know their exact field names.
         state: dev.state || null,
+        lastReading: dev.lastReading || null,
     };
-    // Best-effort rainfall — if the station doesn't have a rain sensor the
-    // statistics call will return zeros (or 4xx, which fetchRainfallTotals
-    // swallows into nulls). Either way, we don't fail the whole row.
     try {
         Object.assign(row, await fetchRainfallTotals(dev._id, ranges));
     } catch (e) {
-        // Already handled per-window inside fetchRainfallTotals, but guard the
-        // whole call just in case.
         console.warn(`[ws] rainfall fetch failed for ${dev.name}: ${e.message}`);
     }
     return row;
@@ -210,13 +204,31 @@ let isSyncing = false;
 async function syncAllData() {
     if (isSyncing) return;
     isSyncing = true;
+    _assetCache = new Map(); // fresh cache per sync
     console.log(`[${new Date().toISOString()}] Starting full data sync...`);
 
     try {
         const ranges = buildRanges();
 
-        // ── Rain gauges (existing behaviour, now with lat/lng/type) ──────────
-        const rainDevices = await getDevicesByType(RAIN_GAUGE_TYPE_ID);
+        // ── Fetch everything in one call, then split by name prefix ──────────
+        // (DynaSys confirmed: rain gauges are named "RG - ..." and weather
+        // stations are named "WS - ...".)
+        let allDevices = [];
+        try {
+            allDevices = await getAllDevices();
+        } catch (e) {
+            console.warn(`[sync] getAllDevices failed, falling back to rain-gauge-only: ${e.message}`);
+            allDevices = await getDevicesByType(RAIN_GAUGE_TYPE_ID);
+        }
+
+        const rainDevices = allDevices.filter(d => /^RG/i.test((d.name || '').trim()));
+        const wsDevices = allDevices.filter(d => /^WS/i.test((d.name || '').trim()));
+        const unrecognised = allDevices.length - rainDevices.length - wsDevices.length;
+        if (unrecognised > 0) {
+            console.warn(`[sync] ${unrecognised} devices didn't match RG/WS name prefix and will be skipped.`);
+        }
+
+        // ── Rain gauges ──────────────────────────────────────────────────────
         const rainGauges = [];
         const chunkSize = 10; // batch so we don't overwhelm GarajCloud
         for (let i = 0; i < rainDevices.length; i += chunkSize) {
@@ -224,24 +236,14 @@ async function syncAllData() {
             const rows = await Promise.all(chunk.map(d => buildRainGaugeRow(d, ranges)));
             rainGauges.push(...rows);
         }
-        // Sort by highest 24h rainfall (preserved from original)
         rainGauges.sort((a, b) => (b["24h"] ?? 0) - (a["24h"] ?? 0));
 
-        // ── Weather stations (new, best-effort) ──────────────────────────────
-        let weatherStations = [];
-        try {
-            const wsTypeId = await discoverWeatherStationTypeId();
-            if (wsTypeId) {
-                const wsDevices = await getDevicesByType(wsTypeId);
-                for (let i = 0; i < wsDevices.length; i += chunkSize) {
-                    const chunk = wsDevices.slice(i, i + chunkSize);
-                    const rows = await Promise.all(chunk.map(d => buildWeatherStationRow(d, ranges)));
-                    weatherStations.push(...rows);
-                }
-                console.log(`[${new Date().toISOString()}] Synced ${weatherStations.length} weather stations.`);
-            }
-        } catch (e) {
-            console.warn(`[ws-sync] non-fatal: ${e.message}`);
+        // ── Weather stations ────────────────────────────────────────────────
+        const weatherStations = [];
+        for (let i = 0; i < wsDevices.length; i += chunkSize) {
+            const chunk = wsDevices.slice(i, i + chunkSize);
+            const rows = await Promise.all(chunk.map(d => buildWeatherStationRow(d, ranges)));
+            weatherStations.push(...rows);
         }
 
         const finalData = {
@@ -255,7 +257,7 @@ async function syncAllData() {
         };
 
         fs.writeFileSync(CACHE_FILE, JSON.stringify(finalData, null, 2));
-        console.log(`[${new Date().toISOString()}] Sync complete! Saved ${rainGauges.length} rain gauges, ${weatherStations.length} weather stations.`);
+        console.log(`[${new Date().toISOString()}] Sync complete! Saved ${rainGauges.length} rain gauges, ${weatherStations.length} weather stations. Assets cached: ${_assetCache.size}.`);
 
     } catch (e) {
         console.error("Critical error during sync:", e.message);
@@ -284,21 +286,16 @@ app.get('/ping', (req, res) => {
 
 // Main endpoint for your dashboard — unchanged shape. `devices` is rain
 // gauges only, just as before, so existing consumers keep working. Each
-// row now includes `lat`, `lng`, and `type: 'rain_gauge'` in addition to
-// the original fields.
+// row now also includes `lat`, `lng`, and `type: 'rain_gauge'`.
 app.get('/api', (req, res) => {
     const data = readCache();
     if (!data) {
         return res.status(503).json({ error: "Server just booted up. Fetching data for the first time, please refresh in 2 minutes." });
     }
-    // Strip the new top-level fields so the response stays byte-similar to
-    // the legacy version. (lat/lng/type on each device are additive and
-    // harmless to old consumers.)
     res.json({ lastUpdated: data.lastUpdated, devices: data.devices || data.rainGauges || [] });
 });
 
-// New: everything in one response. Rain gauges + weather stations, each
-// tagged with `type`. Use this for clients that want both.
+// Rain gauges + weather stations in one response.
 app.get('/api/all', (req, res) => {
     const data = readCache();
     if (!data) {
@@ -311,7 +308,7 @@ app.get('/api/all', (req, res) => {
     });
 });
 
-// New: just weather stations.
+// Weather stations only.
 app.get('/api/weather-stations', (req, res) => {
     const data = readCache();
     if (!data) {
@@ -330,34 +327,31 @@ app.get('/force-sync', (req, res) => {
 });
 
 // ── DEBUG ENDPOINTS ──────────────────────────────────────────────────────
-// Hit these once during setup to discover what GarajCloud is returning, then
-// you can leave them in (read-only, safe) or remove if you'd rather not
-// expose the upstream shape publicly.
-
-// Dump GarajCloud's device-types list so we can find the weather-station ID.
-app.get('/api/debug/device-types', async (req, res) => {
+// Dump one raw device payload (rain gauge by default; pass ?type=ws for a
+// weather station) so we can see GarajCloud's full response.
+app.get('/api/debug/device-raw', async (req, res) => {
     try {
-        const raw = await getDeviceTypes();
-        res.json({ discovered_ws_type_id: WEATHER_STATION_TYPE_ID, deviceTypes: raw });
+        const all = await getAllDevices();
+        const wanted = req.query.type === 'ws'
+            ? all.find(d => /^WS/i.test(d.name || ''))
+            : all.find(d => /^RG/i.test(d.name || ''));
+        res.json(wanted || { error: "no matching device" });
     } catch (e) {
         res.status(500).json({ error: e.message, response: e.response?.data });
     }
 });
 
-// Dump one raw device payload (rain gauge by default; pass ?type=ws for a
-// weather station) so we can see where lat/lng/state actually live.
-app.get('/api/debug/device-raw', async (req, res) => {
+// Dump one raw asset payload to confirm geoLocation.coordinates shape.
+app.get('/api/debug/asset-raw', async (req, res) => {
     try {
-        let typeId = RAIN_GAUGE_TYPE_ID;
-        if (req.query.type === 'ws') {
-            typeId = WEATHER_STATION_TYPE_ID || await discoverWeatherStationTypeId();
-            if (!typeId) {
-                return res.status(404).json({ error: "Weather-station device type ID not discovered yet. Hit /api/debug/device-types first." });
-            }
-        }
-        const url = `${BASE_URL}/apps/ignite-shield/external/devices`;
-        const r = await axios.get(url, { ...axiosConfig, params: { deviceType: typeId, skip: 0, limit: 1 } });
-        res.json(r.data);
+        const all = await getAllDevices();
+        const first = all[0];
+        if (!first) return res.json({ error: "no devices" });
+        const assetId = typeof first.asset === 'string' ? first.asset : (first.asset?._id || first.asset?.id);
+        if (!assetId) return res.json({ error: "no asset on first device", device: first });
+        const url = `${BASE_URL}/apps/ignite-shield/external/assets/${assetId}`;
+        const r = await axios.get(url, axiosConfig);
+        res.json({ assetId, asset: r.data });
     } catch (e) {
         res.status(500).json({ error: e.message, response: e.response?.data });
     }
@@ -369,12 +363,10 @@ app.get('/api/debug/device-raw', async (req, res) => {
 app.listen(PORT, () => {
     console.log(`Backend Server running on port ${PORT}`);
 
-    // Schedule the sync to run automatically every 10 minutes
     cron.schedule('*/10 * * * *', () => {
         syncAllData();
     });
 
-    // Run a sync immediately when the server boots up
     if (!fs.existsSync(CACHE_FILE)) {
         syncAllData();
     }
