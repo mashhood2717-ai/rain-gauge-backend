@@ -93,6 +93,16 @@ function extractCoordsFromAsset(asset) {
     return { lat, lng };
 }
 
+// GarajCloud hard-caps every rainfall statistics query at a one-month span:
+//   HTTP 400 {"message":"Date range cannot exceed 1 month"}
+// That cap — not the `unit` value — is what used to make this_year and all_time
+// fail. Ranges longer than a month are therefore summed from calendar-month
+// slices (see monthWindows/fetchRangeTotal). `unit` only sets bucket
+// granularity inside a window, so the long ranges use `day`.
+//
+// all_time is deliberately absent: 2010 -> now is ~200 slices per device, so at
+// 133 devices it's ~26k upstream calls per sync. It needs a stored running
+// total, not a live query.
 function buildRanges() {
     const now = new Date();
     const pktNow = new Date(now.getTime() + PKT_OFFSET_MS);
@@ -107,14 +117,92 @@ function buildRanges() {
     janFirst.setUTCMonth(0, 1);
     janFirst.setUTCHours(0, 0, 0, 0);
 
-    // Arbitrary past date to cover "since installation"
-    const installationDate = new Date(Date.UTC(2010, 0, 1));
-
     return {
         "24h": { unit: "hour", start: toUtc(new Date(pktNow.getTime() - 24 * 3600000)), end: toUtc(pktNow) },
         "daily": { unit: "hour", start: toUtc(todayMidnight), end: toUtc(pktNow) },
-        "7d": { unit: "day", start: toUtc(new Date(todayMidnight.getTime() - 7 * 86400000)), end: toUtc(pktNow) }
+        "7d": { unit: "day", start: toUtc(new Date(todayMidnight.getTime() - 7 * 86400000)), end: toUtc(pktNow) },
+        "30d": { unit: "day", start: toUtc(new Date(todayMidnight.getTime() - 30 * 86400000)), end: toUtc(pktNow) },
+        "this_year": { unit: "day", start: toUtc(janFirst), end: toUtc(pktNow) }
     };
+}
+
+// Any range at or under this many days is safe to request in one shot. A "30d"
+// range actually spans ~31 days once today's elapsed hours are included, so it
+// takes the sliced path too rather than sitting right on the upstream cap.
+const MAX_SINGLE_SPAN_DAYS = 27;
+
+// Split [startIso, endIso] into consecutive PKT calendar-month windows. Each
+// window stops 1 ms before the next month opens, so every span is strictly
+// under one month and no reading is counted twice across slices.
+function monthWindows(startIso, endIso) {
+    const windows = [];
+    const endMs = Date.parse(endIso);
+    let cursor = Date.parse(startIso);
+
+    while (cursor < endMs) {
+        const pkt = new Date(cursor + PKT_OFFSET_MS);
+        const monthStartMs = Date.UTC(pkt.getUTCFullYear(), pkt.getUTCMonth(), 1) - PKT_OFFSET_MS;
+        const nextMonthMs = Date.UTC(pkt.getUTCFullYear(), pkt.getUTCMonth() + 1, 1) - PKT_OFFSET_MS;
+        const windowEndMs = nextMonthMs < endMs ? nextMonthMs - 1 : endMs;
+
+        windows.push({
+            start: new Date(cursor).toISOString(),
+            end: new Date(windowEndMs).toISOString(),
+            monthKey: `${pkt.getUTCFullYear()}-${String(pkt.getUTCMonth() + 1).padStart(2, "0")}`,
+            // The cache key is the month itself, so only a window covering a
+            // WHOLE elapsed month may be memoized. A 30d slice starting
+            // mid-month must never be stored under that month's key.
+            wholeElapsedMonth: cursor === monthStartMs && nextMonthMs <= endMs
+        });
+
+        cursor = nextMonthMs;
+    }
+
+    return windows;
+}
+
+// A fully elapsed calendar month's total can never change, so memoize it for
+// the life of the process. Keeps this_year at one upstream call per device per
+// sync once warm, instead of one call per month elapsed this year.
+const _monthTotalCache = new Map();
+
+async function fetchWindowTotal(deviceId, start, end, unit) {
+    const url = `${BASE_URL}/apps/ignite-shield/external/readings/statistics/current-rainfall`;
+    const res = await axios.get(url, {
+        ...axiosConfig,
+        params: {
+            "timestamp.gte": start,
+            "timestamp.lte": end,
+            device: deviceId,
+            unit,
+            aggregationType: "Sum"
+        }
+    });
+    const stats = res.data?.data?.statistics ?? [];
+    return stats.reduce((sum, s) => sum + (s.value || 0), 0);
+}
+
+async function fetchRangeTotal(deviceId, range) {
+    const spanDays = (Date.parse(range.end) - Date.parse(range.start)) / 86400000;
+    if (spanDays <= MAX_SINGLE_SPAN_DAYS) {
+        return fetchWindowTotal(deviceId, range.start, range.end, range.unit);
+    }
+
+    let total = 0;
+    for (const win of monthWindows(range.start, range.end)) {
+        const cacheKey = `${deviceId}:${win.monthKey}`;
+        if (win.wholeElapsedMonth && _monthTotalCache.has(cacheKey)) {
+            total += _monthTotalCache.get(cacheKey);
+            continue;
+        }
+
+        const value = await fetchWindowTotal(deviceId, win.start, win.end, range.unit);
+        if (win.wholeElapsedMonth) {
+            _monthTotalCache.set(cacheKey, value);
+        }
+        total += value;
+    }
+    return total;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -125,23 +213,17 @@ async function fetchRainfallTotals(deviceId, ranges) {
     const out = {};
     for (const [period, range] of Object.entries(ranges)) {
         try {
-            const url = `${BASE_URL}/apps/ignite-shield/external/readings/statistics/current-rainfall`;
-            const res = await axios.get(url, {
-                ...axiosConfig,
-                params: {
-                    "timestamp.gte": range.start,
-                    "timestamp.lte": range.end,
-                    device: deviceId,
-                    unit: range.unit,
-                    aggregationType: "Sum"
-                }
-            });
-            const stats = res.data?.data?.statistics ?? [];
-            const total = stats.reduce((sum, s) => sum + (s.value || 0), 0);
+            const total = await fetchRangeTotal(deviceId, range);
             out[period] = Math.round(total * 100) / 100;
         } catch (e) {
             out[period] = null;
-            out[`${period}_error`] = e.message;
+            // Surface GarajCloud's own validation text when it sends any — bare
+            // `e.message` is only ever "Request failed with status code 400",
+            // which is what made the original range failures so opaque.
+            out[`${period}_error`] =
+                e.response?.data?.error?.metadata?.error?.[0]?.context?.message ||
+                e.response?.data?.error?.message ||
+                e.message;
         }
     }
     return out;
