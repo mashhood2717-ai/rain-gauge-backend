@@ -137,10 +137,18 @@ async function getAssetById(assetId) {
     }
 }
 
-// Pull lat/lng off a GarajCloud asset payload. Confirmed shape (from DynaSys):
-//   asset.geoLocation = { type: 'Point', coordinates: [lng, lat] }
-// Still defensive — falls back to other common paths so a single API change
-// upstream doesn't blank out every map pin.
+// Pull lat/lng off a GarajCloud asset payload. Two coordinate fields exist and
+// they frequently DISAGREE:
+//   asset.info.location = { lat, lng }                        ← the per-site pin
+//       configured in GarajCloud. Accurate and distinct per device.
+//   asset.geoLocation   = { type: 'Point', coordinates: [lng, lat] }
+//       A stale placeholder for most devices — dozens share a single point and
+//       some sit >200 km from the real site (e.g. "RG - Chungi No 9 Multan"
+//       reads as 31.73,72.98 here but is actually at 30.21,71.47). NOT reliable.
+// Verified against all 137 devices on 2026-08-08: info.location is present and
+// valid for every one, and beats geoLocation on 98 of them. So info.location
+// wins; geoLocation is only a fallback. The extra fallbacks stay so a single
+// upstream change doesn't blank out every map pin.
 function extractCoordsFromAsset(asset) {
     if (!asset || typeof asset !== 'object') return { lat: null, lng: null };
     const num = (v) => {
@@ -149,12 +157,21 @@ function extractCoordsFromAsset(asset) {
         return Number.isFinite(n) ? n : null;
     };
 
-    // Confirmed GarajCloud shape (GeoJSON Point — [lng, lat] order)
-    if (Array.isArray(asset.geoLocation?.coordinates) && asset.geoLocation.coordinates.length >= 2) {
-        return { lat: num(asset.geoLocation.coordinates[1]), lng: num(asset.geoLocation.coordinates[0]) };
+    // Preferred: the accurate per-site location object.
+    const infoLat = num(asset.info?.location?.lat);
+    const infoLng = num(asset.info?.location?.lng);
+    if (infoLat !== null && infoLng !== null) {
+        return { lat: infoLat, lng: infoLng };
     }
 
-    // Defensive fallbacks
+    // Fallback: GeoJSON Point ([lng, lat] order).
+    if (Array.isArray(asset.geoLocation?.coordinates) && asset.geoLocation.coordinates.length >= 2) {
+        const gLat = num(asset.geoLocation.coordinates[1]);
+        const gLng = num(asset.geoLocation.coordinates[0]);
+        if (gLat !== null && gLng !== null) return { lat: gLat, lng: gLng };
+    }
+
+    // Further defensive fallbacks.
     if (Array.isArray(asset.location?.coordinates) && asset.location.coordinates.length >= 2) {
         return { lat: num(asset.location.coordinates[1]), lng: num(asset.location.coordinates[0]) };
     }
