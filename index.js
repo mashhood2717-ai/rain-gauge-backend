@@ -16,7 +16,38 @@ const CACHE_FILE = path.join(__dirname, 'rain_data_cache.json');
 
 const API_KEY = "a10187411c5bc066f220a98aa88a52e7:e29a0c11f5cbb5b45cffc80a835fa790f0dc5369198fd6b366e1c488520f57589d4e078d9105836db968f6c5ce8bc370c740ad1c7b4d88cecace41c7f976e5b2908d5427c664302b1c080d5536d854e54f91792738e05f67e611c9bb8504300cfc8c88601a7f2e7bfb1028194c3614a6e1cc427d95b2af4194058954f6b7af814c82e3aebc45b0629f64504bd52b75392e578708024ddb206a9b29976ab9a8a8aa9c3b75c8bcc9062492747d01a2b40600a407df33078e835f977a71ffeec167ce87c9bc2311630acb4edb9da978a78d2a8e707c7c91d990e485ac2ce318f5ba5a8a655e53b96c636fa642d03ad45ecb";
 const BASE_URL = "https://http.api.connectivity-dynasys.garajcloud.com/api";
-const RAIN_GAUGE_TYPE_ID = "67fd6a83336210a2d40cba16";
+
+// GarajCloud deviceType ids, verified against the live fleet on 2026-08-06.
+// Classifying on these instead of on the device NAME is the whole point: the
+// old `/^RG/i` / `/^WS/i` name-prefix test silently discarded every device that
+// didn't happen to start with those two letters, which is why the 11 "LS - ..."
+// water-level sensors never appeared in any dashboard or count.
+// Note rain gauges span TWO ids — filtering on one loses 43 of 134 gauges.
+const DEVICE_TYPES = {
+    "675b2c99e31c10760b8c792c": "rain_gauge",     // 43 gauges
+    "67fd6a83336210a2d40cba16": "rain_gauge",     // 91 gauges
+    "692d8807b82612c69a09b716": "weather_station", // 3 stations
+    "68652d9a8cdc909a9a9326d2": "level_sensor"     // 11 water-level sensors
+};
+const RAIN_GAUGE_TYPE_IDS = Object.keys(DEVICE_TYPES).filter((id) => DEVICE_TYPES[id] === "rain_gauge");
+
+// deviceType is authoritative; the name prefix is only a fallback for a device
+// whose type id we haven't catalogued yet. Anything still unknown is reported
+// rather than dropped — a device we can't classify is a bug to look at, not
+// something to silently omit from the fleet count.
+function classifyDevice(dev) {
+    const rawType = typeof dev.deviceType === "object"
+        ? (dev.deviceType?._id || dev.deviceType?.id)
+        : dev.deviceType;
+    const known = DEVICE_TYPES[rawType];
+    if (known) return known;
+
+    const name = (dev.name || "").trim();
+    if (/^RG/i.test(name)) return "rain_gauge";
+    if (/^WS/i.test(name)) return "weather_station";
+    if (/^LS/i.test(name)) return "level_sensor";
+    return "unknown";
+}
 
 const PKT_OFFSET_MS = 5 * 60 * 60 * 1000; // Pakistan Time (UTC+5)
 const axiosConfig = { headers: { "api-key": API_KEY } };
@@ -25,21 +56,60 @@ const axiosConfig = { headers: { "api-key": API_KEY } };
 // DEVICE / ASSET FETCH HELPERS
 // ═══════════════════════════════════════════════════════════════
 
-// Pull the entire device list in one call (no deviceType filter) so we get
-// rain gauges AND weather stations together. GarajCloud paginates with skip
-// /limit — for now 200 covers both types comfortably (87 RG + 3 WS = 90).
+// Pull the ENTIRE device list, following GarajCloud's skip/limit pagination to
+// exhaustion. This used to be a single `limit: 200` call, which silently
+// truncates once the fleet outgrows it — a growth bug that hides new devices
+// with no error anywhere.
 async function getAllDevices() {
     const url = `${BASE_URL}/apps/ignite-shield/external/devices`;
-    const res = await axios.get(url, { ...axiosConfig, params: { skip: 0, limit: 200 } });
-    return res.data?.data?.devices ?? [];
+    const pageSize = 100;
+    const devices = [];
+    let skip = 0;
+    let total = null;
+
+    for (;;) {
+        const res = await axios.get(url, {
+            ...axiosConfig,
+            params: { skip, limit: pageSize, returnTotal: true }
+        });
+        const page = res.data?.data?.devices ?? [];
+        if (total === null) {
+            total = res.data?.pagination?.total ?? null;
+        }
+        devices.push(...page);
+
+        if (page.length < pageSize) break;
+        if (total !== null && devices.length >= total) break;
+        skip += pageSize;
+        // Hard stop so a pagination quirk upstream can never spin forever.
+        if (skip > 5000) {
+            console.warn('[devices] pagination guard hit at skip=5000');
+            break;
+        }
+    }
+
+    if (total !== null && devices.length !== total) {
+        console.warn(`[devices] fetched ${devices.length} but upstream reports total=${total}`);
+    }
+    return devices;
 }
 
-// Fallback path (kept so the rain-gauge-only sync still works if the no-
-// filter call ever returns something unexpected).
-async function getDevicesByType(deviceTypeId) {
+// Fallback path, used only if the unfiltered listing fails. Accepts several
+// deviceType ids because rain gauges are NOT one type upstream — they are split
+// across two (see DEVICE_TYPES), and filtering on just one silently loses the
+// other 43 gauges.
+async function getDevicesByType(deviceTypeIds) {
     const url = `${BASE_URL}/apps/ignite-shield/external/devices`;
-    const res = await axios.get(url, { ...axiosConfig, params: { deviceType: deviceTypeId, skip: 0, limit: 100 } });
-    return res.data?.data?.devices ?? [];
+    const ids = Array.isArray(deviceTypeIds) ? deviceTypeIds : [deviceTypeIds];
+    const devices = [];
+    for (const deviceType of ids) {
+        const res = await axios.get(url, {
+            ...axiosConfig,
+            params: { deviceType, skip: 0, limit: 200 }
+        });
+        devices.push(...(res.data?.data?.devices ?? []));
+    }
+    return devices;
 }
 
 // Per-sync asset cache so multiple devices pointing at the same asset only
@@ -242,6 +312,9 @@ async function buildRainGaugeRow(dev, ranges) {
     const row = {
         id: dev._id,
         name: dev.name,
+        // Explicit type so consumers never have to re-guess from the name.
+        // The uptime Worker and the dashboards both read this.
+        type: 'rain_gauge',
         status: dev.state?.status,
         lat: coords.lat,
         lng: coords.lng,
@@ -279,6 +352,7 @@ async function buildWeatherStationRow(dev) {
     return {
         id: dev._id,
         name: dev.name,
+        type: 'weather_station',
         status: dev.state?.status,
         lat: coords.lat,
         lng: coords.lng,
@@ -288,6 +362,27 @@ async function buildWeatherStationRow(dev) {
         wind_speed:     readingValue(lr, 'Wind_Speed'),
         pressure:       readingValue(lr, 'Pressure'),
         heat_index:     readingValue(lr, 'Heat_Index'),
+    };
+}
+
+// Water-level sensors on Lahore drains and channels. They measure a distance to
+// the water surface in feet (`Distance-ft`), plus a position and a battery
+// level — no rainfall, no weather. Kept as their own type so nothing downstream
+// mistakes them for gauges reporting 0 mm.
+async function buildLevelSensorRow(dev) {
+    const coords = await resolveCoords(dev);
+    const lr = dev.lastReading || {};
+    return {
+        id: dev._id,
+        name: dev.name,
+        type: 'level_sensor',
+        status: dev.state?.status,
+        lat: coords.lat,
+        lng: coords.lng,
+        water_level_ft: readingValue(lr, 'Distance'),
+        position:       readingValue(lr, 'Position'),
+        battery_level:  typeof dev.state?.batteryLevel === 'number' ? dev.state.batteryLevel : null,
+        last_seen:      dev.state?.lastSeen ?? null,
     };
 }
 
@@ -305,29 +400,37 @@ async function syncAllData() {
     try {
         const ranges = buildRanges();
 
-        // ── Fetch everything in one call, then split by name prefix ──────────
-        // (DynaSys confirmed: rain gauges are named "RG - ..." and weather
-        // stations are named "WS - ...".)
+        // ── Fetch the whole fleet, then split by deviceType ─────────────────
+        // Classification is by deviceType id (see DEVICE_TYPES), NOT by name
+        // prefix. A device is never dropped for having an unexpected name.
         let allDevices = [];
         try {
             allDevices = await getAllDevices();
         } catch (e) {
-            console.warn(`[sync] getAllDevices failed, falling back to rain-gauge-only: ${e.message}`);
-            allDevices = await getDevicesByType(RAIN_GAUGE_TYPE_ID);
+            console.warn(`[sync] getAllDevices failed, falling back to rain-gauge types only: ${e.message}`);
+            allDevices = await getDevicesByType(RAIN_GAUGE_TYPE_IDS);
         }
 
-        const rainDevices = allDevices.filter(d => /^RG/i.test((d.name || '').trim()));
-        const wsDevices = allDevices.filter(d => /^WS/i.test((d.name || '').trim()));
-        const unrecognised = allDevices.length - rainDevices.length - wsDevices.length;
-        if (unrecognised > 0) {
-            console.warn(`[sync] ${unrecognised} devices didn't match RG/WS name prefix and will be skipped.`);
+        const byType = { rain_gauge: [], weather_station: [], level_sensor: [], unknown: [] };
+        for (const dev of allDevices) {
+            byType[classifyDevice(dev)].push(dev);
+        }
+
+        if (byType.unknown.length > 0) {
+            // Loud, and still included in the fleet below — an unclassifiable
+            // device is a cataloguing gap to fix, not something to hide.
+            console.warn(
+                `[sync] ${byType.unknown.length} device(s) have an uncatalogued deviceType and are being ` +
+                `reported as type "unknown": ` +
+                byType.unknown.map((d) => `"${d.name}" (deviceType=${typeof d.deviceType === 'object' ? d.deviceType?._id : d.deviceType})`).join(', ')
+            );
         }
 
         // ── Rain gauges ──────────────────────────────────────────────────────
         const rainGauges = [];
         const chunkSize = 10; // batch so we don't overwhelm GarajCloud
-        for (let i = 0; i < rainDevices.length; i += chunkSize) {
-            const chunk = rainDevices.slice(i, i + chunkSize);
+        for (let i = 0; i < byType.rain_gauge.length; i += chunkSize) {
+            const chunk = byType.rain_gauge.slice(i, i + chunkSize);
             const rows = await Promise.all(chunk.map(d => buildRainGaugeRow(d, ranges)));
             rainGauges.push(...rows);
         }
@@ -337,21 +440,47 @@ async function syncAllData() {
         // No rainfall fetch for WS (one device returns a 32-bit overflow value
         // upstream; the other two report 0) — temp/humidity/wind/pressure
         // come straight from the device's lastReading map.
-        const weatherStations = await Promise.all(wsDevices.map(d => buildWeatherStationRow(d)));
+        const weatherStations = await Promise.all(byType.weather_station.map(d => buildWeatherStationRow(d)));
 
-        // `/api` returns RG + WS combined so the Cloudflare Worker (which
-        // hits `/api` and writes one row per device to D1 every 15 min)
-        // tracks uptime/downtime for ALL devices, not just rain gauges.
-        // Each device is identifiable by the `RG - ` / `WS - ` name prefix.
+        // ── Water-level sensors ─────────────────────────────────────────────
+        const levelSensors = await Promise.all(byType.level_sensor.map(d => buildLevelSensorRow(d)));
+
+        // Anything we couldn't classify still ships, carrying only the fields
+        // every device has, so it shows up in fleet counts and uptime tracking.
+        const unknownDevices = await Promise.all(byType.unknown.map(async (dev) => {
+            const coords = await resolveCoords(dev);
+            return {
+                id: dev._id,
+                name: dev.name,
+                type: 'unknown',
+                status: dev.state?.status,
+                lat: coords.lat,
+                lng: coords.lng,
+            };
+        }));
+
+        // `/api` returns the WHOLE fleet so the Cloudflare Worker (which hits
+        // `/api` and writes one row per device to D1 every 15 min) tracks
+        // uptime for every device. Filter on the explicit `type` field —
+        // 'rain_gauge' | 'weather_station' | 'level_sensor' | 'unknown'.
+        // Do NOT infer type from the name.
         const finalData = {
             lastUpdated: new Date().toISOString(),
-            devices: [...rainGauges, ...weatherStations],
+            devices: [...rainGauges, ...weatherStations, ...levelSensors, ...unknownDevices],
             rainGauges,
             weatherStations,
+            levelSensors,
+            counts: {
+                total: allDevices.length,
+                rainGauges: rainGauges.length,
+                weatherStations: weatherStations.length,
+                levelSensors: levelSensors.length,
+                unknown: unknownDevices.length,
+            },
         };
 
         fs.writeFileSync(CACHE_FILE, JSON.stringify(finalData, null, 2));
-        console.log(`[${new Date().toISOString()}] Sync complete! Saved ${rainGauges.length} rain gauges, ${weatherStations.length} weather stations (${finalData.devices.length} total). Assets cached: ${_assetCache.size}.`);
+        console.log(`[${new Date().toISOString()}] Sync complete! ${rainGauges.length} rain gauges, ${weatherStations.length} weather stations, ${levelSensors.length} level sensors, ${unknownDevices.length} unknown (${finalData.devices.length} of ${allDevices.length} upstream). Assets cached: ${_assetCache.size}.`);
 
     } catch (e) {
         console.error("Critical error during sync:", e.message);
@@ -392,7 +521,7 @@ app.get('/api', (req, res) => {
     res.json({ lastUpdated: data.lastUpdated, devices: data.devices || data.rainGauges || [] });
 });
 
-// Rain gauges + weather stations in one response.
+// Every device class in one response, plus the fleet counts.
 app.get('/api/all', (req, res) => {
     const data = readCache();
     if (!data) {
@@ -402,7 +531,31 @@ app.get('/api/all', (req, res) => {
         lastUpdated: data.lastUpdated,
         rainGauges: data.rainGauges || data.devices || [],
         weatherStations: data.weatherStations || [],
+        levelSensors: data.levelSensors || [],
+        counts: data.counts || null,
     });
+});
+
+// Water-level sensors only (Lahore drains/channels — `water_level_ft`).
+app.get('/api/level-sensors', (req, res) => {
+    const data = readCache();
+    if (!data) {
+        return res.status(503).json({ error: "Server just booted up. Fetching data for the first time, please refresh in 2 minutes." });
+    }
+    res.json({
+        lastUpdated: data.lastUpdated,
+        devices: data.levelSensors || [],
+    });
+});
+
+// Fleet counts on their own — cheap endpoint for dashboards that only need
+// totals and shouldn't have to pull every device row to compute them.
+app.get('/api/counts', (req, res) => {
+    const data = readCache();
+    if (!data) {
+        return res.status(503).json({ error: "Server just booted up. Fetching data for the first time, please refresh in 2 minutes." });
+    }
+    res.json({ lastUpdated: data.lastUpdated, counts: data.counts || null });
 });
 
 // Weather stations only.
