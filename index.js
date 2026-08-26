@@ -50,7 +50,15 @@ function classifyDevice(dev) {
 }
 
 const PKT_OFFSET_MS = 5 * 60 * 60 * 1000; // Pakistan Time (UTC+5)
-const axiosConfig = { headers: { "api-key": API_KEY } };
+
+// GarajCloud now REQUIRES a `timezone` header on every request (format +HH:MM).
+// Without it the statistics endpoints reject the call with HTTP 400
+// "Missing timezone header" and no data comes back at all. The value tells the
+// API to compute period aggregations (daily/monthly rainfall totals) against
+// Pakistan local time rather than UTC. Every axios call spreads axiosConfig, so
+// setting it here covers all of them.
+const TIMEZONE_HEADER = "+05:00"; // Pakistan Standard Time (UTC+5)
+const axiosConfig = { headers: { "api-key": API_KEY, "timezone": TIMEZONE_HEADER } };
 
 // ═══════════════════════════════════════════════════════════════
 // DEVICE / ASSET FETCH HELPERS
