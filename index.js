@@ -58,7 +58,49 @@ const PKT_OFFSET_MS = 5 * 60 * 60 * 1000; // Pakistan Time (UTC+5)
 // Pakistan local time rather than UTC. Every axios call spreads axiosConfig, so
 // setting it here covers all of them.
 const TIMEZONE_HEADER = "+05:00"; // Pakistan Standard Time (UTC+5)
-const axiosConfig = { headers: { "api-key": API_KEY, "timezone": TIMEZONE_HEADER } };
+// Every upstream call needs a timeout. axios has none by default, so a single
+// request that never answers would hold `isSyncing` true forever and silently
+// freeze every later sync while /api kept serving old data.
+const UPSTREAM_TIMEOUT_MS = 30000;
+const axiosConfig = {
+    headers: { "api-key": API_KEY, "timezone": TIMEZONE_HEADER },
+    timeout: UPSTREAM_TIMEOUT_MS
+};
+
+// GarajCloud rate-limits with HTTP 429. A sync sends several hundred requests,
+// and without retries every 429 became a `null` rainfall value on the
+// dashboard. Retry 429s, gateway errors and dropped connections with backoff,
+// honouring Retry-After when the server sends it.
+const MAX_ATTEMPTS = 4;
+const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
+const RETRYABLE_CODES = new Set(["ECONNRESET", "ETIMEDOUT", "ECONNABORTED", "EAI_AGAIN"]);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function isRetryable(e) {
+    if (e.response) return RETRYABLE_STATUS.has(e.response.status);
+    return RETRYABLE_CODES.has(e.code);
+}
+
+function retryDelayMs(e, attempt) {
+    const retryAfter = e.response?.headers?.["retry-after"];
+    const secs = Number(retryAfter);
+    if (retryAfter !== undefined && retryAfter !== null && retryAfter !== "" && Number.isFinite(secs) && secs >= 0) {
+        return Math.min(secs * 1000, 30000);
+    }
+    // 1s, 2s, 4s plus jitter so parallel requests don't retry in lockstep.
+    return 1000 * 2 ** (attempt - 1) + Math.floor(Math.random() * 500);
+}
+
+async function upstreamGet(url, config = axiosConfig) {
+    for (let attempt = 1; ; attempt++) {
+        try {
+            return await axios.get(url, config);
+        } catch (e) {
+            if (attempt >= MAX_ATTEMPTS || !isRetryable(e)) throw e;
+            await sleep(retryDelayMs(e, attempt));
+        }
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════
 // DEVICE / ASSET FETCH HELPERS
@@ -76,7 +118,7 @@ async function getAllDevices() {
     let total = null;
 
     for (;;) {
-        const res = await axios.get(url, {
+        const res = await upstreamGet(url, {
             ...axiosConfig,
             params: { skip, limit: pageSize, returnTotal: true }
         });
@@ -111,7 +153,7 @@ async function getDevicesByType(deviceTypeIds) {
     const ids = Array.isArray(deviceTypeIds) ? deviceTypeIds : [deviceTypeIds];
     const devices = [];
     for (const deviceType of ids) {
-        const res = await axios.get(url, {
+        const res = await upstreamGet(url, {
             ...axiosConfig,
             params: { deviceType, skip: 0, limit: 200 }
         });
@@ -130,7 +172,7 @@ async function getAssetById(assetId) {
     if (_assetCache.has(assetId)) return _assetCache.get(assetId);
     try {
         const url = `${BASE_URL}/apps/ignite-shield/external/assets/${assetId}`;
-        const res = await axios.get(url, axiosConfig);
+        const res = await upstreamGet(url, axiosConfig);
         // Response could be { data: { asset } } or { data: <asset> } depending
         // on the API style — handle both.
         const asset = res.data?.data?.asset ?? res.data?.data ?? res.data ?? null;
@@ -263,7 +305,7 @@ const _monthTotalCache = new Map();
 
 async function fetchWindowTotal(deviceId, start, end, unit) {
     const url = `${BASE_URL}/apps/ignite-shield/external/readings/statistics/current-rainfall`;
-    const res = await axios.get(url, {
+    const res = await upstreamGet(url, {
         ...axiosConfig,
         params: {
             "timestamp.gte": start,
@@ -332,7 +374,32 @@ async function resolveCoords(dev) {
     return extractCoordsFromAsset(asset);
 }
 
-async function buildRainGaugeRow(dev, ranges) {
+// How long a previous sync's value may stand in for a period that failed this
+// sync. Past this the period goes back to null instead of showing data that is
+// quietly hours old.
+const MAX_CARRY_FORWARD_MS = 60 * 60 * 1000;
+
+// When a period still fails after retries, reuse the last good value from the
+// previous sync instead of blanking it. The row keeps `<period>_error` so the
+// failure stays visible, and gains `<period>_asOf`: the time the carried value
+// was actually computed. A period with no `_asOf` was fetched fresh this sync.
+function carryForward(row, prevRow, prevLastUpdated, periods) {
+    if (!prevRow) return 0;
+    let carried = 0;
+    for (const period of periods) {
+        if (row[period] !== null) continue;
+        const prevValue = prevRow[period];
+        if (typeof prevValue !== 'number') continue;
+        const asOf = prevRow[`${period}_asOf`] || prevLastUpdated;
+        if (!asOf || Date.now() - Date.parse(asOf) > MAX_CARRY_FORWARD_MS) continue;
+        row[period] = prevValue;
+        row[`${period}_asOf`] = asOf;
+        carried++;
+    }
+    return carried;
+}
+
+async function buildRainGaugeRow(dev, ranges, prevRow, prevLastUpdated) {
     const coords = await resolveCoords(dev);
     const row = {
         id: dev._id,
@@ -345,6 +412,7 @@ async function buildRainGaugeRow(dev, ranges) {
         lng: coords.lng,
     };
     Object.assign(row, await fetchRainfallTotals(dev._id, ranges));
+    carryForward(row, prevRow, prevLastUpdated, Object.keys(ranges));
     return row;
 }
 
@@ -452,12 +520,29 @@ async function syncAllData() {
         }
 
         // ── Rain gauges ──────────────────────────────────────────────────────
+        // The previous sync's rows back-fill any period that still fails here.
+        const prevCache = readCache();
+        const prevRainRows = new Map((prevCache?.rainGauges || []).map((r) => [r.id, r]));
+
         const rainGauges = [];
-        const chunkSize = 10; // batch so we don't overwhelm GarajCloud
+        // Batch so we don't overwhelm GarajCloud. At 10 at a time it started
+        // answering 429 for roughly 1 in 5 gauges.
+        const chunkSize = 5;
         for (let i = 0; i < byType.rain_gauge.length; i += chunkSize) {
             const chunk = byType.rain_gauge.slice(i, i + chunkSize);
-            const rows = await Promise.all(chunk.map(d => buildRainGaugeRow(d, ranges)));
+            const rows = await Promise.all(chunk.map(d =>
+                buildRainGaugeRow(d, ranges, prevRainRows.get(d._id), prevCache?.lastUpdated)
+            ));
             rainGauges.push(...rows);
+        }
+
+        const periods = Object.keys(ranges);
+        const failedPeriods = rainGauges.reduce(
+            (n, r) => n + periods.filter((p) => r[`${p}_error`]).length, 0);
+        const carriedPeriods = rainGauges.reduce(
+            (n, r) => n + periods.filter((p) => r[`${p}_asOf`]).length, 0);
+        if (failedPeriods > 0) {
+            console.warn(`[sync] ${failedPeriods} rainfall period(s) failed after retries; ${carriedPeriods} filled from the previous sync, ${failedPeriods - carriedPeriods} left null.`);
         }
         rainGauges.sort((a, b) => (b["24h"] ?? 0) - (a["24h"] ?? 0));
 
@@ -625,7 +710,7 @@ app.get('/api/debug/asset-raw', async (req, res) => {
         const assetId = typeof first.asset === 'string' ? first.asset : (first.asset?._id || first.asset?.id);
         if (!assetId) return res.json({ error: "no asset on first device", device: first });
         const url = `${BASE_URL}/apps/ignite-shield/external/assets/${assetId}`;
-        const r = await axios.get(url, axiosConfig);
+        const r = await upstreamGet(url, axiosConfig);
         res.json({ assetId, asset: r.data });
     } catch (e) {
         res.status(500).json({ error: e.message, response: e.response?.data });
