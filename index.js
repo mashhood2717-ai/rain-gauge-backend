@@ -14,7 +14,13 @@ app.use(cors()); // Allow your frontend portal to fetch this API
 const PORT = process.env.PORT || 3000;
 const CACHE_FILE = path.join(__dirname, 'rain_data_cache.json');
 
-const API_KEY = "a10187411c5bc066f220a98aa88a52e7:e29a0c11f5cbb5b45cffc80a835fa790f0dc5369198fd6b366e1c488520f57589d4e078d9105836db968f6c5ce8bc370c740ad1c7b4d88cecace41c7f976e5b2908d5427c664302b1c080d5536d854e54f91792738e05f67e611c9bb8504300cfc8c88601a7f2e7bfb1028194c3614a6e1cc427d95b2af4194058954f6b7af814c82e3aebc45b0629f64504bd52b75392e578708024ddb206a9b29976ab9a8a8aa9c3b75c8bcc9062492747d01a2b40600a407df33078e835f977a71ffeec167ce87c9bc2311630acb4edb9da978a78d2a8e707c7c91d990e485ac2ce318f5ba5a8a655e53b96c636fa642d03ad45ecb";
+// The GarajCloud key comes from the environment (set it under Environment in
+// the Render dashboard). It must never be committed: this repo is public.
+const API_KEY = (process.env.GARAJ_API_KEY || "").trim();
+if (!API_KEY) {
+    console.error("GARAJ_API_KEY is not set. Add it as an environment variable (Render: Environment tab) and restart.");
+    process.exit(1);
+}
 const BASE_URL = "https://http.api.connectivity-dynasys.garajcloud.com/api";
 
 // GarajCloud deviceType ids, verified against the live fleet on 2026-08-06.
